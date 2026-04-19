@@ -5,14 +5,14 @@
 The `photos` subcommand automates organizing camera photos into a date-based directory hierarchy. It has two modes depending on whether an input (`-i`) is supplied:
 
 - **Sort mode** (no input): reorganize photos already sitting in the root of the output directory.
-- **Import mode** (with input): recursively move photos from an input directory into the output, merging with any existing structure.
+- **Import mode** (with input): move photos from an input directory into the output, merging with any existing structure.
 
 ---
 
 ## CLI Shape
 
 ```
-file-sort photos [OUTPUT] [-o OUTPUT] [-i INPUT] [--dry-run]
+file-sort photos [OUTPUT] [-o OUTPUT] [-i INPUT] [-r] [--dry-run]
 ```
 
 | Argument | Description |
@@ -20,9 +20,10 @@ file-sort photos [OUTPUT] [-o OUTPUT] [-i INPUT] [--dry-run]
 | `OUTPUT` (positional) | Destination directory. Defaults to current directory. |
 | `-o` / `--output` | Alternative way to specify destination. Conflicts with positional arg. |
 | `-i` / `--input` | Source directory. When absent the tool runs in sort mode. |
+| `-r` / `--recursive` | Recurse into subdirectories of the input. Without this flag only the top level of the input dir is scanned. |
 | `--dry-run` | Print intended actions; do not move or create anything. |
 
-The existing top-level flags (`-e`, `--ignore`, `-r`) are untouched — they belong to the implicit default command (the current extension-based sorter). With subcommands introduced, the existing behaviour becomes reachable as `file-sort sort <directory>` while `file-sort <directory>` will still work as a shorthand via a default subcommand alias.
+The existing extension-based sorter remains the default `file-sort <directory>` invocation for backwards compatibility. A `sort` subcommand alias is also added so `file-sort sort <directory>` works identically.
 
 ---
 
@@ -36,7 +37,7 @@ The existing top-level flags (`-e`, `--ignore`, `-r`) are untouched — they bel
       IMG_002.heic
       RAW/
         IMG_003.raf
-    2026-04-20 - 2026-04-21/  ← day-range dir (consecutive days)
+    2026-04-20 - 2026-04-21/  ← day-range dir (date range)
       IMG_010.jpg
       RAW/
         IMG_011.raf
@@ -50,16 +51,21 @@ Example: `2026 - 04 April`, `2025 - 12 December`.
 ### Day subdirectory format
 
 - **Single day**: `YYYY-MM-DD`
-- **Date range** (consecutive days, same month): `YYYY-MM-DD - YYYY-MM-DD`
+- **Date range**: `YYYY-MM-DD - YYYY-MM-DD`
 
-A "consecutive" group is a maximal run of calendar days with no gap. Days are grouped per month — a sequence spanning a month boundary produces a separate dir in each month.
+A group is formed from photos whose dates are no more than 2 calendar days apart from the adjacent date in the sorted sequence. If the gap between two adjacent dates exceeds 2 days, a new group begins. Days are grouped per month — a sequence spanning a month boundary produces a separate dir in each month.
 
 ### File placement
 
 | Extension | Destination within the day dir |
 |---|---|
 | `.jpg`, `.jpeg`, `.heic` | Day dir root |
-| Everything else (raw formats: `.raf`, `.cr2`, `.nef`, `.arw`, `.dng`, `.rw2`, …) | `RAW/` sub-subdirectory |
+| `.mp4`, `.mov` | Day dir root |
+| `.raf`, `.cr2`, `.nef`, `.arw`, `.dng`, `.rw2`, and other non-listed types *when JPG/HEIC/MP4/MOV also exist in the group* | `RAW/` sub-subdirectory |
+| Any non-listed types *when no JPG/HEIC/MP4/MOV exist in the group* | Day dir root |
+| Multiple differing non-listed extensions in the same group | Sorted into per-extension subdirectories using the existing extension-sort logic |
+
+The RAW subdir only exists when there are "primary" files (JPG/HEIC/MP4/MOV) to distinguish from. If a group contains only raw files, they are placed in the day dir root. If a group contains a mix of unlisted types (e.g. `.raf` and `.xmp`), those types each get their own subdir via the existing extension-sort logic.
 
 ---
 
@@ -86,30 +92,37 @@ chrono = "0.4"    # date arithmetic and formatting
 1. Scan files in the **root** of the output directory only (non-recursive); ignore existing subdirectories.
 2. Extract the date for each file.
 3. Group files by month.
-4. Within each month, sort files by date and compute consecutive-day clusters.
+4. Within each month, sort files by date and compute clusters (gap ≤ 2 days between adjacent dates).
 5. Determine the day-dir name (single date or range) for each cluster.
-6. In dry-run: print each planned move. Otherwise:
-   - Create `<output>/<month-dir>/<day-dir>/` (and `RAW/` as needed).
+6. Determine file placement within the day dir (root vs `RAW/` vs per-extension subdir) based on the mix of types present in the cluster.
+7. In dry-run: print each planned move. Otherwise:
+   - Create `<output>/<month-dir>/<day-dir>/` (and subdirs as needed).
    - Move each file to its destination.
 
 ### Import mode (with `-i`)
 
-1. Walk the input directory **recursively**, collecting all photo files.
+1. Scan files in the input directory. If `-r` is passed, walk recursively; otherwise scan the top level only.
 2. Extract the date for each file.
 3. For each file, determine its target month dir.
-4. **Check for an existing day dir** in `<output>/<month-dir>/` that contains at least one photo sharing the same calendar date. If found, use that dir regardless of its name (it may be `Hiking Trip` instead of `2026-04-15`).
-5. If no matching existing dir is found, batch newly-imported files by consecutive-day clusters (same logic as sort mode) to derive a new day-dir name.
+4. **Check for an existing day dir** in `<output>/<month-dir>/`. A dir matches if either:
+   - it contains at least one photo with the **same calendar date**, or
+   - the incoming photo's date falls **strictly between** the earliest and latest dates of photos already in that dir (i.e. the photo slots into an existing range even if no photo shares its exact date).
+   
+   If a match is found, use that dir regardless of its name.
+5. If no matching existing dir is found, batch newly-imported files by clusters (same gap ≤ 2 days logic) to derive a new day-dir name.
 6. **Duplicate detection**: if a file with the **same name** already exists in the target dir and its EXIF date matches, skip it and leave it in the input directory. Print a notice.
 7. In dry-run: print each planned move/skip. Otherwise move files.
 
 #### Finding the matching existing day dir
 
 For each candidate subdirectory under `<output>/<month-dir>/`:
-- Scan its root for HEIC/JPG files and its `RAW/` subdir for raw files.
-- Collect their EXIF dates.
-- If any date in that dir matches the incoming file's date → use this dir.
+- Scan its root and any `RAW/` subdir for photo files.
+- Collect their EXIF dates and derive a `(min_date, max_date)` range.
+- The dir **matches** the incoming file if:
+  - the incoming date equals any date already present in the dir, **or**
+  - `min_date < incoming_date < max_date` (the date slots into the existing span).
 
-This scan is done lazily per month, building a `date → existing_dir` map once per month, then reused for all files targeting that month.
+This scan is done lazily per month, building a `(min_date, max_date, path) → existing_dir` map once per month, then reused for all files targeting that month.
 
 ---
 
@@ -152,20 +165,22 @@ IMG_003.raf   (EXIF: 2026-04-15)
 
 ---
 
-### Scenario 2 — Sort mode, multi-day consecutive
+### Scenario 2 — Sort mode, gap tolerance grouping
+
+Photos within 2 days of each other are grouped; a gap of 3+ days starts a new group.
 
 **Before** (`/Photos/` root):
 ```
 IMG_001.jpg   (EXIF: 2026-04-15)
-IMG_002.jpg   (EXIF: 2026-04-16)
-IMG_003.jpg   (EXIF: 2026-04-20)
+IMG_002.jpg   (EXIF: 2026-04-17)   ← 2 days after 15th → same group
+IMG_003.jpg   (EXIF: 2026-04-20)   ← 3 days after 17th → new group
 IMG_004.jpg   (EXIF: 2026-04-21)
 ```
 
 **After**:
 ```
 2026 - 04 April/
-  2026-04-15 - 2026-04-16/
+  2026-04-15 - 2026-04-17/
     IMG_001.jpg
     IMG_002.jpg
   2026-04-20 - 2026-04-21/
@@ -175,9 +190,55 @@ IMG_004.jpg   (EXIF: 2026-04-21)
 
 ---
 
-### Scenario 3 — Sort mode, month boundary
+### Scenario 3 — Sort mode, RAW-only group
 
-Photos from March 31 and April 1 are **not** grouped into a range because they fall in different month directories.
+When a group contains no JPG/HEIC/MP4/MOV files, raw files are placed in the day dir root rather than a `RAW/` subdir.
+
+**Before** (`/Photos/` root):
+```
+IMG_001.raf  (EXIF: 2026-04-15)
+IMG_002.raf  (EXIF: 2026-04-15)
+```
+
+**After**:
+```
+2026 - 04 April/
+  2026-04-15/
+    IMG_001.raf
+    IMG_002.raf
+```
+
+---
+
+### Scenario 4 — Sort mode, mixed non-listed types
+
+When a group has multiple different unlisted extension types alongside primary files, non-primary types each get a per-extension subdir.
+
+**Before** (`/Photos/` root):
+```
+IMG_001.jpg  (EXIF: 2026-04-15)
+IMG_001.raf  (EXIF: 2026-04-15)
+IMG_001.xmp  (EXIF: 2026-04-15)
+VID_001.mp4  (EXIF: 2026-04-15)
+```
+
+**After**:
+```
+2026 - 04 April/
+  2026-04-15/
+    IMG_001.jpg
+    VID_001.mp4
+    RAW/
+      IMG_001.raf
+    XMP/
+      IMG_001.xmp
+```
+
+---
+
+### Scenario 5 — Sort mode, month boundary
+
+Photos from March 31 and April 1 are never grouped across a month boundary.
 
 **Before** (`/Photos/` root):
 ```
@@ -197,7 +258,7 @@ IMG_002.jpg  (EXIF: 2026-04-01)
 
 ---
 
-### Scenario 4 — Import mode, merging into a named existing dir
+### Scenario 6 — Import mode, merging into a named existing dir
 
 **Existing output** (`/Photos/`):
 ```
@@ -227,11 +288,37 @@ IMG_011.raf  (EXIF: 2026-04-16)
       IMG_011.raf  ← imported
 ```
 
-`Hiking Trip/` is matched because it contains photos from both 2026-04-15 and 2026-04-16, which overlap with the incoming dates.
+`Hiking Trip/` is matched because it already contains photos from 2026-04-15 and 2026-04-16.
 
 ---
 
-### Scenario 5 — Import mode, new photos alongside an existing dir
+### Scenario 7 — Import mode, date falls within existing dir's span
+
+**Existing output** (`/Photos/`):
+```
+2026 - 04 April/
+  Hiking Trip/
+    IMG_001.jpg  (EXIF: 2026-04-14)
+    IMG_003.jpg  (EXIF: 2026-04-16)   ← note: no photo on the 15th
+```
+
+**Input**:
+```
+IMG_002.jpg  (EXIF: 2026-04-15)   ← no exact match, but 14th < 15th < 16th
+```
+
+**After** (photo placed in `Hiking Trip/` because its date falls within the existing span):
+```
+2026 - 04 April/
+  Hiking Trip/
+    IMG_001.jpg
+    IMG_002.jpg   ← imported
+    IMG_003.jpg
+```
+
+---
+
+### Scenario 8 — Import mode, new photos alongside an existing dir
 
 **Existing output** (`/Photos/`):
 ```
@@ -260,7 +347,7 @@ No existing dir covers the 20th–21st, so a new range dir is created:
 
 ---
 
-### Scenario 6 — Import mode, duplicate skip
+### Scenario 9 — Import mode, duplicate skip
 
 **Existing output** (`/Photos/`):
 ```
@@ -271,17 +358,17 @@ No existing dir covers the 20th–21st, so a new range dir is created:
 
 **Input**:
 ```
-IMG_001.jpg  (EXIF: 2026-04-15)   ← same name, same date
-IMG_002.jpg  (EXIF: 2026-04-15)   ← same date, different name
+IMG_001.jpg  (EXIF: 2026-04-15)   ← same name, same date → skip
+IMG_002.jpg  (EXIF: 2026-04-15)   ← same date, different name → import
 ```
 
 **After**:
-- `IMG_001.jpg` in input is **skipped** (left in place) — name and date already present.
-- `IMG_002.jpg` is moved into `2026-04-15/` as normal.
+- `IMG_001.jpg` in input is **left in place** — name and date already present.
+- `IMG_002.jpg` is moved into `2026-04-15/`.
 
 ---
 
-### Scenario 7 — Import mode, cross-month batch
+### Scenario 10 — Import mode, cross-month batch
 
 **Input**:
 ```
@@ -291,7 +378,7 @@ IMG_003.jpg  (EXIF: 2026-04-01)
 IMG_004.jpg  (EXIF: 2026-04-02)
 ```
 
-The March files and April files are in different months so they cannot share a single date-range dir:
+The gap from March 31 → April 1 crosses a month boundary, so they produce separate dirs even though they are only 1 day apart:
 
 **After**:
 ```
@@ -309,26 +396,15 @@ The March files and April files are in different months so they cannot share a s
 
 ## Implementation Structure
 
-The code will be split across modules:
-
 ```
 src/
-  main.rs          — CLI definition and dispatch
-  sort.rs          — existing extension-sorter logic (extracted)
+  main.rs          — CLI definition and dispatch (adds `photos` + `sort` alias)
+  sort.rs          — existing extension-sorter logic (extracted from main.rs)
   photos/
     mod.rs         — entry point: parse args, call sort or import
     date.rs        — EXIF date extraction helpers
-    group.rs       — consecutive-day cluster logic
-    layout.rs      — month/day dir naming, RAW subdir routing
+    group.rs       — date cluster logic (gap ≤ 2 days, per-month)
+    layout.rs      — month/day dir naming, file placement routing
     scan.rs        — scanning output for existing date→dir mapping
     ops.rs         — file move / dry-run print operations
 ```
-
----
-
-## Open Questions / Decisions Needed
-
-1. **Default grouping threshold**: should photos only 1 day apart always be grouped, or should there be a gap tolerance (e.g. group if ≤ 2 days apart)? Current plan: strictly consecutive (no gaps).
-2. **Mixed-format day dirs**: if a day dir only has RAW files (no JPG/HEIC), there will be only a `RAW/` subdir inside. Is that acceptable?
-3. **Existing subcommand naming**: the current default behaviour (extension sort) — should it remain the default `file-sort <dir>` invocation, or be moved explicitly to `file-sort sort <dir>`? Current plan: keep backwards-compatible default.
-4. **RAW format list**: the plan treats any non-JPG/JPEG/HEIC as RAW. Should there be an explicit allowlist of photo extensions, with non-photo files ignored?

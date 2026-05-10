@@ -3,8 +3,17 @@ use std::fs;
 use std::io::BufReader;
 use std::path::Path;
 
-pub fn extract_date(path: &Path) -> Option<NaiveDate> {
-    exif_date(path).or_else(|| fs_date(path))
+#[derive(Clone, Copy)]
+pub enum DateSource {
+    Metadata,
+    Filesystem,
+}
+
+pub fn extract_date(path: &Path, source: DateSource) -> Option<NaiveDate> {
+    match source {
+        DateSource::Metadata => exif_date(path).or_else(|| fs_date(path)),
+        DateSource::Filesystem => fs_date(path),
+    }
 }
 
 fn exif_date(path: &Path) -> Option<NaiveDate> {

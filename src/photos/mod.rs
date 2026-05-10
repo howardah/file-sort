@@ -1,6 +1,7 @@
 use chrono::{Datelike, NaiveDate};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,6 +12,7 @@ mod layout;
 mod ops;
 mod scan;
 
+use date::DateSource;
 use group::{cluster_by_date, PhotoFile};
 use layout::{day_dir_name, file_subdir, is_primary, month_dir_name};
 use scan::{find_matching_dir, scan_month_dir};
@@ -66,6 +68,12 @@ pub fn subcommand() -> Command {
                 .help("Print planned actions without making any changes")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("fast")
+                .long("fast")
+                .help("Use filesystem modified dates instead of EXIF metadata")
+                .action(ArgAction::SetTrue),
+        )
 }
 
 pub fn run(matches: &ArgMatches) {
@@ -78,11 +86,16 @@ pub fn run(matches: &ArgMatches) {
     let input = matches.get_one::<String>("input").map(PathBuf::from);
     let recursive = matches.get_flag("recursive");
     let dry_run = matches.get_flag("dry_run");
+    let date_source = if matches.get_flag("fast") {
+        DateSource::Filesystem
+    } else {
+        DateSource::Metadata
+    };
 
     if let Some(input_dir) = input {
-        import_mode(&input_dir, &output, recursive, dry_run);
+        import_mode(&input_dir, &output, recursive, dry_run, date_source);
     } else {
-        sort_mode(&output, dry_run);
+        sort_mode(&output, dry_run, date_source);
     }
 }
 
@@ -90,9 +103,9 @@ pub fn run(matches: &ArgMatches) {
 // Sort mode
 // ---------------------------------------------------------------------------
 
-fn sort_mode(output: &Path, dry_run: bool) {
+fn sort_mode(output: &Path, dry_run: bool, date_source: DateSource) {
     let raw_paths = collect_files(output, false, "Scanning output directory");
-    let files = extract_photo_files(raw_paths, "Extracting photo dates");
+    let files = extract_photo_files(raw_paths, "Extracting photo dates", date_source);
 
     if files.is_empty() {
         println!("No files to sort.");
@@ -115,7 +128,7 @@ fn sort_mode(output: &Path, dry_run: bool) {
         })
         .collect();
 
-    let stats = execute_plan(&plan, dry_run, "Organizing photos");
+    let stats = execute_plan(&plan, dry_run, "Organizing photos", date_source);
     print_summary(&stats, dry_run, "sort");
 }
 
@@ -123,9 +136,15 @@ fn sort_mode(output: &Path, dry_run: bool) {
 // Import mode
 // ---------------------------------------------------------------------------
 
-fn import_mode(input: &Path, output: &Path, recursive: bool, dry_run: bool) {
+fn import_mode(
+    input: &Path,
+    output: &Path,
+    recursive: bool,
+    dry_run: bool,
+    date_source: DateSource,
+) {
     let raw_paths = collect_files(input, recursive, "Scanning input directory");
-    let files = extract_photo_files(raw_paths, "Extracting photo dates");
+    let files = extract_photo_files(raw_paths, "Extracting photo dates", date_source);
 
     if files.is_empty() {
         println!("No files to import.");
@@ -150,7 +169,7 @@ fn import_mode(input: &Path, output: &Path, recursive: bool, dry_run: bool) {
         month_progress.set_message(format!("Matching {}", month_dir_name(sample)));
 
         let existing = if month_dir.exists() {
-            scan_month_dir(&month_dir)
+            scan_month_dir(&month_dir, date_source)
         } else {
             Vec::new()
         };
@@ -198,7 +217,7 @@ fn import_mode(input: &Path, output: &Path, recursive: bool, dry_run: bool) {
 
     month_progress.finish_with_message("Matching complete");
 
-    let stats = execute_plan(&plan, dry_run, "Organizing photos");
+    let stats = execute_plan(&plan, dry_run, "Organizing photos", date_source);
     print_summary(&stats, dry_run, "import");
 }
 
@@ -236,27 +255,38 @@ fn collect_files(dir: &Path, recursive: bool, label: &str) -> Vec<PathBuf> {
     result
 }
 
-fn extract_photo_files(paths: Vec<PathBuf>, label: &str) -> Vec<PhotoFile> {
+fn extract_photo_files(paths: Vec<PathBuf>, label: &str, date_source: DateSource) -> Vec<PhotoFile> {
     if paths.is_empty() {
         return Vec::new();
     }
 
     let progress = progress_bar(paths.len() as u64, label);
-    let mut files: Vec<PhotoFile> = Vec::with_capacity(paths.len());
+    let files: Vec<PhotoFile> = paths
+        .into_par_iter()
+        .filter_map(|path| {
+            let extracted = date::extract_date(&path, date_source);
+            progress.inc(1);
 
-    for path in paths {
-        match date::extract_date(&path) {
-            Some(d) => files.push(PhotoFile { path, date: d }),
-            None => progress.println(format!("Warning: no date found for {}, skipping", path.display())),
-        }
-        progress.inc(1);
-    }
+            match extracted {
+                Some(d) => Some(PhotoFile { path, date: d }),
+                None => {
+                    progress.println(format!("Warning: no date found for {}, skipping", path.display()));
+                    None
+                }
+            }
+        })
+        .collect();
 
     progress.finish_with_message(format!("{label}: {} files ready", files.len()));
     files
 }
 
-fn execute_plan(plan: &[PlannedBatch], dry_run: bool, label: &str) -> ExecutionStats {
+fn execute_plan(
+    plan: &[PlannedBatch],
+    dry_run: bool,
+    label: &str,
+    date_source: DateSource,
+) -> ExecutionStats {
     let total_files: u64 = plan.iter().map(|batch| batch.files.len() as u64).sum();
     let mut stats = ExecutionStats::default();
 
@@ -287,7 +317,7 @@ fn execute_plan(plan: &[PlannedBatch], dry_run: bool, label: &str) -> ExecutionS
             let dest_path = dest_dir.join(file_name);
 
             if batch.check_duplicates && dest_path.exists() {
-                if let Some(existing_date) = date::extract_date(&dest_path) {
+                if let Some(existing_date) = date::extract_date(&dest_path, date_source) {
                     if existing_date == file.date {
                         stats.processed += 1;
                         stats.skipped += 1;

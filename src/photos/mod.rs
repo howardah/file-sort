@@ -1,7 +1,9 @@
 use chrono::{Datelike, NaiveDate};
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 mod date;
 mod group;
@@ -12,6 +14,21 @@ mod scan;
 use group::{cluster_by_date, PhotoFile};
 use layout::{day_dir_name, file_subdir, is_primary, month_dir_name};
 use scan::{find_matching_dir, scan_month_dir};
+
+struct PlannedBatch {
+    dest_root: PathBuf,
+    files: Vec<PhotoFile>,
+    has_primaries: bool,
+    check_duplicates: bool,
+}
+
+#[derive(Default)]
+struct ExecutionStats {
+    processed: u64,
+    moved: u64,
+    skipped: u64,
+    failed: u64,
+}
 
 pub fn subcommand() -> Command {
     Command::new("photos")
@@ -74,56 +91,32 @@ pub fn run(matches: &ArgMatches) {
 // ---------------------------------------------------------------------------
 
 fn sort_mode(output: &Path, dry_run: bool) {
-    let Ok(entries) = std::fs::read_dir(output) else {
-        eprintln!("Error reading output directory: {}", output.display());
-        return;
-    };
-
-    let mut files: Vec<PhotoFile> = Vec::new();
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        match date::extract_date(&path) {
-            Some(d) => files.push(PhotoFile { path, date: d }),
-            None => eprintln!("Warning: no date found for {}, skipping", path.display()),
-        }
-    }
+    let raw_paths = collect_files(output, false, "Scanning output directory");
+    let files = extract_photo_files(raw_paths, "Extracting photo dates");
 
     if files.is_empty() {
         println!("No files to sort.");
         return;
     }
 
-    if dry_run {
-        println!("[DRY RUN] Would move:");
-    }
+    let plan: Vec<PlannedBatch> = cluster_by_date(files)
+        .into_iter()
+        .map(|cluster| {
+            let month_dir = output.join(month_dir_name(cluster.start));
+            let day_dir = month_dir.join(day_dir_name(cluster.start, cluster.end));
+            let has_primaries = any_primary(&cluster.files);
 
-    for cluster in cluster_by_date(files) {
-        let month_dir = output.join(month_dir_name(cluster.start));
-        let day_dir = month_dir.join(day_dir_name(cluster.start, cluster.end));
-        let has_primaries = any_primary(&cluster.files);
-
-        for file in &cluster.files {
-            let ext = ext_of(&file.path);
-            let dest_dir = match file_subdir(ext, has_primaries) {
-                None => day_dir.clone(),
-                Some(sub) => day_dir.join(sub),
-            };
-
-            if dry_run {
-                println!(
-                    "  {}\n    → {}\n",
-                    file.path.display(),
-                    dest_dir.join(file.path.file_name().unwrap()).display()
-                );
-            } else {
-                ops::move_file(&file.path, &dest_dir);
+            PlannedBatch {
+                dest_root: day_dir,
+                files: cluster.files,
+                has_primaries,
+                check_duplicates: false,
             }
-        }
-    }
+        })
+        .collect();
+
+    let stats = execute_plan(&plan, dry_run, "Organizing photos");
+    print_summary(&stats, dry_run, "sort");
 }
 
 // ---------------------------------------------------------------------------
@@ -131,23 +124,12 @@ fn sort_mode(output: &Path, dry_run: bool) {
 // ---------------------------------------------------------------------------
 
 fn import_mode(input: &Path, output: &Path, recursive: bool, dry_run: bool) {
-    let raw_paths = collect_files(input, recursive);
-
-    let mut files: Vec<PhotoFile> = Vec::new();
-    for path in raw_paths {
-        match date::extract_date(&path) {
-            Some(d) => files.push(PhotoFile { path, date: d }),
-            None => eprintln!("Warning: no date found for {}, skipping", path.display()),
-        }
-    }
+    let raw_paths = collect_files(input, recursive, "Scanning input directory");
+    let files = extract_photo_files(raw_paths, "Extracting photo dates");
 
     if files.is_empty() {
         println!("No files to import.");
         return;
-    }
-
-    if dry_run {
-        println!("[DRY RUN] Would move:");
     }
 
     // Group by (year, month)
@@ -159,9 +141,13 @@ fn import_mode(input: &Path, output: &Path, recursive: bool, dry_run: bool) {
             .push(file);
     }
 
+    let month_progress = progress_bar(by_month.len() as u64, "Matching files to existing folders");
+    let mut plan: Vec<PlannedBatch> = Vec::new();
+
     for ((year, month), month_files) in by_month {
         let sample = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
         let month_dir = output.join(month_dir_name(sample));
+        month_progress.set_message(format!("Matching {}", month_dir_name(sample)));
 
         let existing = if month_dir.exists() {
             scan_month_dir(&month_dir)
@@ -185,82 +171,51 @@ fn import_mode(input: &Path, output: &Path, recursive: bool, dry_run: bool) {
         }
 
         // --- Files merging into an existing day dir ---
-        for (existing_path, files) in &to_existing {
-            let has_primaries =
-                dir_has_primaries(existing_path) || any_primary(files);
-
-            for file in files {
-                let ext = ext_of(&file.path);
-                let dest_dir = match file_subdir(ext, has_primaries) {
-                    None => existing_path.clone(),
-                    Some(sub) => existing_path.join(sub),
-                };
-
-                let file_name = file.path.file_name().unwrap();
-                let dest_path = dest_dir.join(file_name);
-
-                if dest_path.exists() {
-                    if let Some(existing_date) = date::extract_date(&dest_path) {
-                        if existing_date == file.date {
-                            println!(
-                                "[SKIP] {}  (same name and date found in {})\n",
-                                file.path.display(),
-                                existing_path.file_name().unwrap().to_string_lossy()
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                if dry_run {
-                    println!(
-                        "  {}\n    → {}\n",
-                        file.path.display(),
-                        dest_path.display()
-                    );
-                } else {
-                    ops::move_file(&file.path, &dest_dir);
-                }
-            }
+        for (existing_path, files) in to_existing {
+            let has_primaries = dir_has_primaries(&existing_path) || any_primary(&files);
+            plan.push(PlannedBatch {
+                dest_root: existing_path,
+                files,
+                has_primaries,
+                check_duplicates: true,
+            });
         }
 
         // --- Files going into newly created day dirs ---
         for cluster in cluster_by_date(new_files) {
             let day_dir = month_dir.join(day_dir_name(cluster.start, cluster.end));
             let has_primaries = any_primary(&cluster.files);
-
-            for file in &cluster.files {
-                let ext = ext_of(&file.path);
-                let dest_dir = match file_subdir(ext, has_primaries) {
-                    None => day_dir.clone(),
-                    Some(sub) => day_dir.join(sub),
-                };
-
-                if dry_run {
-                    println!(
-                        "  {}\n    → {}\n",
-                        file.path.display(),
-                        dest_dir.join(file.path.file_name().unwrap()).display()
-                    );
-                } else {
-                    ops::move_file(&file.path, &dest_dir);
-                }
-            }
+            plan.push(PlannedBatch {
+                dest_root: day_dir,
+                files: cluster.files,
+                has_primaries,
+                check_duplicates: false,
+            });
         }
+
+        month_progress.inc(1);
     }
+
+    month_progress.finish_with_message("Matching complete");
+
+    let stats = execute_plan(&plan, dry_run, "Organizing photos");
+    print_summary(&stats, dry_run, "import");
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn collect_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
+fn collect_files(dir: &Path, recursive: bool, label: &str) -> Vec<PathBuf> {
     let mut result = Vec::new();
+    let progress = spinner(label);
+
     if recursive {
         for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
             let path = entry.path().to_path_buf();
             if path.is_file() {
                 result.push(path);
+                progress.inc(1);
             }
         }
     } else if let Ok(entries) = std::fs::read_dir(dir) {
@@ -268,10 +223,175 @@ fn collect_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_file() {
                 result.push(path);
+                progress.inc(1);
             }
         }
+    } else {
+        progress.finish_and_clear();
+        eprintln!("Error reading directory: {}", dir.display());
+        return result;
     }
+
+    progress.finish_with_message(format!("{label}: found {} files", result.len()));
     result
+}
+
+fn extract_photo_files(paths: Vec<PathBuf>, label: &str) -> Vec<PhotoFile> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    let progress = progress_bar(paths.len() as u64, label);
+    let mut files: Vec<PhotoFile> = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        match date::extract_date(&path) {
+            Some(d) => files.push(PhotoFile { path, date: d }),
+            None => progress.println(format!("Warning: no date found for {}, skipping", path.display())),
+        }
+        progress.inc(1);
+    }
+
+    progress.finish_with_message(format!("{label}: {} files ready", files.len()));
+    files
+}
+
+fn execute_plan(plan: &[PlannedBatch], dry_run: bool, label: &str) -> ExecutionStats {
+    let total_files: u64 = plan.iter().map(|batch| batch.files.len() as u64).sum();
+    let mut stats = ExecutionStats::default();
+
+    if total_files == 0 {
+        return stats;
+    }
+
+    let progress = if dry_run {
+        println!("[DRY RUN] Would move:");
+        None
+    } else {
+        Some(progress_bar(total_files, label))
+    };
+
+    for batch in plan {
+        if let Some(progress) = progress.as_ref() {
+            progress.set_message(format!("{label}: {}", display_name(&batch.dest_root)));
+        }
+
+        for file in &batch.files {
+            let ext = ext_of(&file.path);
+            let dest_dir = match file_subdir(ext, batch.has_primaries) {
+                None => batch.dest_root.clone(),
+                Some(sub) => batch.dest_root.join(sub),
+            };
+
+            let file_name = file.path.file_name().unwrap();
+            let dest_path = dest_dir.join(file_name);
+
+            if batch.check_duplicates && dest_path.exists() {
+                if let Some(existing_date) = date::extract_date(&dest_path) {
+                    if existing_date == file.date {
+                        stats.processed += 1;
+                        stats.skipped += 1;
+
+                        if dry_run {
+                            println!(
+                                "[DRY RUN] Would skip:\n  {}  (same name and date found in {})\n",
+                                file.path.display(),
+                                display_name(&batch.dest_root)
+                            );
+                        } else if let Some(progress) = progress.as_ref() {
+                            progress.println(format!(
+                                "[SKIP] {}  (same name and date found in {})",
+                                file.path.display(),
+                                display_name(&batch.dest_root)
+                            ));
+                            progress.inc(1);
+                        }
+
+                        continue;
+                    }
+                }
+            }
+
+            if dry_run {
+                println!("  {}\n    → {}\n", file.path.display(), dest_path.display());
+            } else {
+                match ops::move_file(&file.path, &dest_dir) {
+                    Ok(()) => stats.moved += 1,
+                    Err(err) => {
+                        stats.failed += 1;
+                        if let Some(progress) = progress.as_ref() {
+                            progress.println(format!(
+                                "Error moving {}: {}",
+                                file.path.display(),
+                                err
+                            ));
+                        }
+                    }
+                }
+                if let Some(progress) = progress.as_ref() {
+                    progress.inc(1);
+                }
+            }
+
+            stats.processed += 1;
+        }
+    }
+
+    if let Some(progress) = progress {
+        progress.finish_with_message(format!("{label}: processed {} files", stats.processed));
+    }
+
+    stats
+}
+
+fn print_summary(stats: &ExecutionStats, dry_run: bool, mode: &str) {
+    if dry_run {
+        println!("Dry run complete: planned {} files for {}.", stats.processed, mode);
+        return;
+    }
+
+    if stats.failed == 0 && stats.skipped == 0 {
+        println!("Completed {}: moved {} files.", mode, stats.moved);
+        return;
+    }
+
+    println!(
+        "Completed {}: moved {}, skipped {}, failed {}.",
+        mode,
+        stats.moved,
+        stats.skipped,
+        stats.failed
+    );
+}
+
+fn spinner(label: &str) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg} [{pos} files]")
+            .expect("valid spinner template"),
+    );
+    progress.set_message(label.to_string());
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
+}
+
+fn progress_bar(len: u64, label: &str) -> ProgressBar {
+    let progress = ProgressBar::new(len);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+        )
+        .expect("valid progress template")
+        .progress_chars("=> "),
+    );
+    progress.set_message(label.to_string());
+    progress
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn any_primary(files: &[PhotoFile]) -> bool {
